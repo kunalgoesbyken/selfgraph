@@ -2600,6 +2600,68 @@ async def supersede(graph):
         ]
         for rid in (stark, ids.relation_id("person:judy", "WORKS_AT", "company:wonka"))
     }
+    out["parallel_retirement"] = {}
+    for name, caps, arrivals in (
+        (
+            "chronological",
+            (2, 1),
+            (("old", "initech", 1), ("new", "initech", 2), ("other", "acme", 12)),
+        ),
+        (
+            "other_end_unread",
+            (2, 2),
+            (("f0", "initech", 3), ("f1", "acme", 4), ("f3", "initech", 11), ("f2", "initech", 12)),
+        ),
+    ):
+        parallel = SelfGraph(
+            graph.store,
+            namespace=f"{graph.namespace}-parallel-{name}",
+            schema={
+                "entities": SUPERSEDE_SCHEMA["entities"],
+                "relations": [
+                    {
+                        "type": "WORKS_AT",
+                        "from": {"types": ["Person"], "max_count": caps[0]},
+                        "to": {"types": ["Company"], "max_count": caps[1]},
+                    }
+                ],
+            },
+            contradiction="supersede",
+        )
+        await parallel.initialize()
+        await parallel.insert.facts(
+            {
+                "entities": [
+                    *({"type": "Person", "name": n} for n in ("Ann", "Bob")),
+                    *({"type": "Company", "name": n} for n in ("Initech", "Acme")),
+                ]
+            }
+        )
+        for rid, company, month in arrivals:
+            person = "person:bob" if rid == "f2" else "person:ann"
+            await parallel.insert.facts(
+                {
+                    "relations": [
+                        {
+                            "id": f"relation:{rid}",
+                            "from_entity": person,
+                            "type": "WORKS_AT",
+                            "to_entity": f"company:{company}",
+                            "event_time": datetime(2020, month, 15, tzinfo=timezone.utc),
+                        }
+                    ]
+                }
+            )
+        listed = await parallel.relations.list(include_invalidated=True)
+        out["parallel_retirement"][name] = {
+            r.id: [
+                r.revision,
+                r.is_current,
+                r.invalidated_by,
+                _serde.json_iso(r.invalidated_at) if r.invalidated_at else None,
+            ]
+            for r in listed.items
+        }
     kim = [{"type": "Person", "name": "Kim"}, *({"type": "Company", "name": n} for n in ("Massive", "Nakatomi"))]
     await graph.insert.facts({"entities": kim})
     for company, year in (("massive", 2020), ("nakatomi", 2022)):
