@@ -549,6 +549,28 @@ def test_a_non_utf8_stdin_schema_reports_a_coded_error_under_surrogateescape():
     assert "Traceback" not in err
 
 
+def test_a_piped_stdout_is_utf8_when_the_locale_encoding_is_not(tmp_path):
+    pytest.importorskip("kuzu")
+    src = os.path.dirname(os.path.dirname(os.path.abspath(selfgraph.__file__)))
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONUTF8"}
+    env.update({"PYTHONPATH": src, "PYTHONIOENCODING": "cp1252"})
+    base = [sys.executable, "-m", "selfgraph.cli", "--store", "kuzu", "--uri", str(tmp_path / "g.kuzu")]
+
+    def run_cli(*args, stdin=None):
+        return subprocess.run([*base, *args], input=stdin, capture_output=True, env=env)
+
+    names = {"org:omega": "Ωmega Корп", "person:zoe": "Zoë"}
+    facts = {"entities": [{"id": key, "type": key.split(":")[0], "name": name} for key, name in names.items()]}
+    inserted = run_cli("insert", "facts", "-", stdin=json.dumps(facts, ensure_ascii=False).encode("utf-8"))
+    assert inserted.returncode == 0, inserted.stderr
+    listed = run_cli("entity", "list")
+    assert listed.returncode == 0, listed.stderr
+    assert {item["id"]: item["name"] for item in json.loads(listed.stdout.decode("utf-8"))["items"]} == names
+    missing = run_cli("entity", "get", "Ω:missing")
+    assert missing.returncode == 1
+    assert "Entity 'Ω:missing' does not exist" in missing.stderr.decode("utf-8")
+
+
 @pytest.mark.parametrize(
     ("argv", "code", "field", "text"),
     [

@@ -4,6 +4,9 @@ Installing the package puts a `selfgraph` command on your path. For TypeScript,
 `npx @hydradb/selfgraph` takes the same flags and commands and prints the same
 JSON. The CLI wraps the same API as the library.
 
+Output is UTF-8 on stdout and stderr, even when the locale is not, so a piped
+Windows run prints the same bytes as the TypeScript CLI.
+
 ```bash
 selfgraph --store kuzu --uri graph.kuzu init
 selfgraph --store kuzu --uri graph.kuzu insert facts graph.json
