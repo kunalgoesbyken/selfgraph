@@ -2995,7 +2995,9 @@ async def create_relation(
     Creating an invalidated relation again reasserts it as a new current revision with exactly the given properties,
     nothing carried over from the retired one, and adds a "relation_reasserted" warning. Without event_time the
     effective time is the creation time. The new version is written before any relation it supersedes is retired; in
-    supersede mode one older than the current relations it conflicts with is written already invalidated.
+    supersede mode one older than the current relations it conflicts with is written already invalidated. A
+    reassertion in supersede mode then settles its max_count endpoints again (see resettle_endpoints), as an insert
+    that moves the relation does.
 
     @param runner (Any): graph runner.
     @param ns (str): namespace.
@@ -3074,6 +3076,10 @@ async def create_relation(
                 f"{rel.revision} with exactly the given properties",
             )
         )
+    if prior is not None and contradiction == "supersede":
+        edge = {"type": rtype, "from_id": from_entity, "to_id": to_entity, "props": props}
+        await resettle_endpoints(runner, ns, [edge], caps, created_at)
+        rel = _relation_of(await _newest_edge(runner, ns, rid, _is_relation_type))
     return rel
 
 

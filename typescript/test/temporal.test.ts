@@ -1233,6 +1233,56 @@ function suite(spec: StoreSpec): void {
     }
   }
 
+  it("restating a retired relation earlier by create settles the other end it sat at", async () => {
+    const spec: Schema = {
+      entities: [{ name: "Person" }, { name: "Company" }],
+      relations: [
+        { type: "WORKS_AT", from: { types: ["Person"], max_count: 1 }, to: { types: ["Company"], max_count: 1 } },
+      ],
+    };
+    const day = (month: number, date: number): Date => new Date(Date.UTC(2020, month - 1, date));
+    const settled = async (how: "insert" | "create") => {
+      const g = open({ schema: spec, contradiction: "supersede" });
+      await g.insert.facts({
+        entities: [
+          ...["Ann", "Bob", "Cy"].map((name) => ({ type: "Person", name })),
+          ...["Globex", "Initech"].map((name) => ({ type: "Company", name })),
+        ],
+      });
+      for (const [rid, person, company, when] of [
+        ["y", "cy", "initech", day(8, 28)],
+        ["b", "bob", "globex", day(5, 30)],
+        ["z", "ann", "globex", day(9, 27)],
+        ["x", "cy", "globex", day(4, 30)],
+      ] as const) {
+        await g.relations.create(`person:${person}`, "WORKS_AT", `company:${company}`, {
+          id: `relation:${rid}`,
+          event_time: when,
+        });
+      }
+      if (how === "insert") {
+        await insert(g, [
+          { id: "relation:b", ...worksAt("person:bob", "company:globex"), event_time: day(3, 1).toISOString() },
+        ]);
+      } else {
+        await g.relations.create("person:bob", "WORKS_AT", "company:globex", {
+          id: "relation:b",
+          event_time: day(3, 1),
+        });
+      }
+      const [x] = await g.relations.versions("relation:x");
+      const valid = await g.retrieve("Cy", { as_of: day(9, 1) });
+      return [
+        [x!.is_current, x!.invalidated_by, x!.invalidated_at],
+        valid.subgraph.relations.map((r) => r.id),
+        (await g.relations.list()).items.map((r) => r.id).sort(),
+      ];
+    };
+    const created = await settled("create");
+    expect(created).toEqual(await settled("insert"));
+    expect(created).toEqual([[false, "relation:y", day(8, 28)], ["relation:y"], ["relation:y", "relation:z"]]);
+  });
+
   it("an insert that moves a fact reports what it stored", async () => {
     const g = await graph("supersede");
     await insert(g, [annAt("acme", 2020)]);

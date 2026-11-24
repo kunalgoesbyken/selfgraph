@@ -3123,7 +3123,9 @@ export interface CreateRelationArgs {
  * Creating an invalidated relation again reasserts it as a new current revision with exactly the given properties,
  * nothing carried over from the retired one, and adds a "relation_reasserted" warning. Without event_time the effective
  * time is the creation time. The new version is written before any relation it supersedes is retired; in supersede
- * mode one older than the current relations it conflicts with is written already invalidated.
+ * mode one older than the current relations it conflicts with is written already invalidated. A reassertion in
+ * supersede mode then settles its max_count endpoints again (see resettleEndpoints), as an insert that moves the
+ * relation does.
  *
  * @param runner (Runner): the graph runner.
  * @param ns (string): the namespace.
@@ -3218,6 +3220,11 @@ export async function createRelation(
           "with exactly the given properties",
       ),
     );
+  }
+  if (prior !== null && options.contradiction === "supersede") {
+    const edge = { type: rtype, from_id: args.from_entity, to_id: args.to_entity, props: written };
+    await resettleEndpoints(runner, ns, [edge], options.caps, createdAt);
+    return (await newestRelation(runner, ns, rid))!;
   }
   return rel;
 }

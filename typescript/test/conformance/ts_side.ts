@@ -3250,6 +3250,35 @@ export async function supersede(graph: SelfGraph): Promise<Record<string, unknow
   const moved_earlier_gap_valid = heldMia.subgraph.relations.map((r) => r.id).sort();
   await graph.insert.facts({
     entities: [
+      ...["Ola", "Pat", "Quin"].map((name) => ({ type: "Person", name })),
+      ...["Rune", "Sage"].map((name) => ({ type: "Company", name })),
+    ],
+  });
+  for (const [rid, person, company, when] of [
+    ["y", "quin", "sage", new Date(Date.UTC(2020, 7, 28))],
+    ["b", "pat", "rune", new Date(Date.UTC(2020, 4, 30))],
+    ["z", "ola", "rune", new Date(Date.UTC(2020, 8, 27))],
+    ["x", "quin", "rune", new Date(Date.UTC(2020, 3, 30))],
+    ["b", "pat", "rune", new Date(Date.UTC(2020, 2, 1))],
+  ] as const) {
+    await graph.relations.create(`person:${person}`, "WORKS_AT", `company:${company}`, {
+      id: `relation:${rid}`,
+      event_time: when,
+    });
+  }
+  const reasserted_earlier: Record<string, unknown> = {};
+  for (const rid of ["b", "x"]) {
+    reasserted_earlier[rid] = (await graph.relations.versions(`relation:${rid}`)).map((v) => [
+      v.revision,
+      v.is_current,
+      v.invalidated_by,
+      v.invalidated_at ? jsonIso(v.invalidated_at) : null,
+    ]);
+  }
+  const heldQuin = await graph.retrieve("Quin", { as_of: new Date(Date.UTC(2020, 8, 1)) });
+  const reasserted_earlier_valid = heldQuin.subgraph.relations.map((r) => r.id).sort();
+  await graph.insert.facts({
+    entities: [
       { type: "Person", name: "Lee" },
       { type: "Company", name: "Umbrella" },
     ],
@@ -3284,6 +3313,8 @@ export async function supersede(graph: SelfGraph): Promise<Record<string, unknow
     moved_later_valid,
     moved_earlier_gap,
     moved_earlier_gap_valid,
+    reasserted_earlier,
+    reasserted_earlier_valid,
     certified_history,
   };
 }

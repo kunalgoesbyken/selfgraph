@@ -2626,6 +2626,32 @@ async def supersede(graph):
     ]
     held_mia = await graph.retrieve("Mia", as_of=datetime(2015, 1, 1, tzinfo=timezone.utc))
     out["moved_earlier_gap_valid"] = sorted(r.id for r in held_mia.subgraph.relations)
+    ron = [{"type": "Person", "name": n} for n in ("Ola", "Pat", "Quin")]
+    await graph.insert.facts({"entities": [*ron, *({"type": "Company", "name": n} for n in ("Rune", "Sage"))]})
+    for rid, person, company, when in (
+        ("y", "quin", "sage", datetime(2020, 8, 28, tzinfo=timezone.utc)),
+        ("b", "pat", "rune", datetime(2020, 5, 30, tzinfo=timezone.utc)),
+        ("z", "ola", "rune", datetime(2020, 9, 27, tzinfo=timezone.utc)),
+        ("x", "quin", "rune", datetime(2020, 4, 30, tzinfo=timezone.utc)),
+        ("b", "pat", "rune", datetime(2020, 3, 1, tzinfo=timezone.utc)),
+    ):
+        await graph.relations.create(
+            f"person:{person}", "WORKS_AT", f"company:{company}", id=f"relation:{rid}", event_time=when
+        )
+    out["reasserted_earlier"] = {
+        rid: [
+            [
+                v.revision,
+                v.is_current,
+                v.invalidated_by,
+                _serde.json_iso(v.invalidated_at) if v.invalidated_at else None,
+            ]
+            for v in await graph.relations.versions(f"relation:{rid}")
+        ]
+        for rid in ("b", "x")
+    }
+    held_quin = await graph.retrieve("Quin", as_of=datetime(2020, 9, 1, tzinfo=timezone.utc))
+    out["reasserted_earlier_valid"] = sorted(r.id for r in held_quin.subgraph.relations)
     lee = [{"type": "Person", "name": "Lee"}, {"type": "Company", "name": "Umbrella"}]
     await graph.insert.facts({"entities": lee, "relations": [link("lee", "umbrella", 2020)]})
     umbrella = ids.relation_id("person:lee", "WORKS_AT", "company:umbrella")

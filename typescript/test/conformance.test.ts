@@ -297,6 +297,12 @@ describe.skipIf(!PY)("cross-language conformance with the Python SDK", () => {
       const gap = fromTs as { moved_earlier_gap: unknown[][]; moved_earlier_gap_valid: string[] };
       expect(gap.moved_earlier_gap).toEqual([[1, false, apertureMia, "2014-01-01T00:00:00Z"]]);
       expect(gap.moved_earlier_gap_valid).toEqual([apertureMia]);
+      const reasserted = fromTs as {
+        reasserted_earlier: Record<string, unknown[][]>;
+        reasserted_earlier_valid: string[];
+      };
+      expect(reasserted.reasserted_earlier.x![0]).toEqual([3, false, "relation:y", "2020-08-28T00:00:00Z"]);
+      expect(reasserted.reasserted_earlier_valid).toEqual(["relation:y"]);
     });
 
     it.skipIf(!live.get(store))(`${store}: unmerging a merge with no source agrees in both languages`, async () => {
