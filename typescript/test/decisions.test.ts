@@ -1,9 +1,73 @@
-import { expect, it } from "vitest";
-import { ids, ValidationError } from "../src/index.js";
-import { forEachStore, freshGraphs, type StoreSpec } from "./helpers.js";
+import { expect, it, vi } from "vitest";
+import { ids, NotFoundError, ValidationError } from "../src/index.js";
+import { L_STEP } from "../src/labels.js";
+import { countStoreWrites, forEachStore, freshGraphs, type StoreSpec } from "./helpers.js";
 
 function suite(spec: StoreSpec): void {
   const open = freshGraphs(spec, "step-ids");
+  const deleteSetup = async (target: "relation" | "entity" | "decision") => {
+    const g = open();
+    for (const name of ["Acme", "Beta", "Gamma"]) await g.entities.create(name, "Org");
+    const first = await g.relations.create("org:acme", "OWNS", "org:beta");
+    const second = await g.relations.create("org:acme", "OWNS", "org:gamma");
+    await g.decisions.create("Buy", { id: "decision:d1", steps: [first.id, second.id], actor_entity: "org:acme" });
+    const remove = () => {
+      if (target === "relation") return g.relations.delete(first.id);
+      if (target === "entity") return g.entities.delete("org:beta");
+      return g.decisions.delete("decision:d1");
+    };
+    return { g, remove };
+  };
+  const leftAfterDelete = async (g: ReturnType<typeof open>) => ({
+    decisions: (await g.decisions.list()).items.map((d) => d.id),
+    step_nodes: (await g.store.matchNodes(g.namespace, L_STEP)).map((n) => n.id as string).sort(),
+    relations: (await g.relations.list()).items.map((r) => r.id).sort(),
+    entities: (await g.entities.list()).items.map((e) => e.id).sort(),
+  });
+  for (const target of ["relation", "entity", "decision"] as const) {
+    it.runIf(!spec.transactional)(
+      `leaves no decision behind when a ${target} delete is cut off at any write and retried`,
+      async () => {
+        const clean = await deleteSetup(target);
+        const writes = await countStoreWrites(clean.g, null, async () => {
+          await clean.remove();
+        });
+        const whole = await leftAfterDelete(clean.g);
+        expect(whole.decisions).toEqual([]);
+        expect(whole.step_nodes).toEqual([]);
+        for (let cut = 0; cut < writes.length; cut++) {
+          const { g, remove } = await deleteSetup(target);
+          await countStoreWrites(g, cut, async () => {
+            await expect(remove()).rejects.toThrow("connection lost");
+          });
+          await remove().catch((error) => {
+            if (!(error instanceof NotFoundError)) throw error;
+          });
+          expect(await leftAfterDelete(g), `cut at write ${cut}: ${writes[cut]}`).toEqual(whole);
+        }
+      },
+    );
+    it.runIf(!spec.transactional)(
+      `removes the steps and counts the decision when a ${target} delete is retried after the trace node is gone`,
+      async () => {
+        const { g, remove } = await deleteSetup(target);
+        const real = g.store.deleteNodes.bind(g.store);
+        const spy = vi.spyOn(g.store, "deleteNodes").mockImplementation(async (ns, label, nodeIds) => {
+          if (label === L_STEP) throw new Error("connection lost");
+          return real(ns, label, nodeIds);
+        });
+        try {
+          await expect(remove()).rejects.toThrow("connection lost");
+        } finally {
+          spy.mockRestore();
+        }
+        expect(await g.decisions.get("decision:d1")).toBeNull();
+        expect((await leftAfterDelete(g)).step_nodes).not.toEqual([]);
+        expect((await remove()).deleted_decisions).toBe(1);
+        expect((await leftAfterDelete(g)).step_nodes).toEqual([]);
+      },
+    );
+  }
   it("keeps every step when a page of decisions holds more than a thousand", async () => {
     const g = open();
     await g.insert.facts({

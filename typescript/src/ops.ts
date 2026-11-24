@@ -1290,11 +1290,42 @@ async function deleteSteps(runner: Runner, ns: string, tid: string): Promise<voi
   }
 }
 
+/**
+ * Read the step nodes of a decision trace by id, found even when the trace node is already gone.
+ *
+ * @param runner (Runner): the graph runner.
+ * @param ns (string): the namespace.
+ * @param tid (string): the trace id.
+ * @return (Props[]): the step nodes.
+ */
+async function stepNodes(runner: Runner, ns: string, tid: string): Promise<Props[]> {
+  const prefix = ids.stepId(tid, 0).slice(0, -1);
+  const found: Props[] = [];
+  let after = prefix;
+  for (;;) {
+    const rows = await runner.matchNodes(ns, L_STEP, { limit: BATCH, id_gt: after });
+    const gone = rows.findIndex((row) => !idOf(row).startsWith(prefix));
+    const mine = gone === -1 ? rows : rows.slice(0, gone);
+    found.push(...mine.filter((row) => ids.traceOfStep(idOf(row)) === tid));
+    if (mine.length < BATCH) return found;
+    after = idOf(mine[mine.length - 1]!);
+  }
+}
+
+/**
+ * Delete a decision trace node, then its steps, which a step lookup still finds if the delete is cut off.
+ *
+ * @param runner (Runner): the graph runner.
+ * @param ns (string): the namespace.
+ * @param tid (string): the trace id.
+ * @return (boolean): true when a trace node or a step was removed.
+ */
 export async function deleteTraceQuietly(runner: Runner, ns: string, tid: string): Promise<boolean> {
-  if (!(await runner.nodeExists(ns, L_TRACE, tid))) return false;
-  await deleteSteps(runner, ns, tid);
-  await runner.deleteNode(ns, L_TRACE, tid);
-  return true;
+  const existed = await runner.nodeExists(ns, L_TRACE, tid);
+  const steps = await stepNodes(runner, ns, tid);
+  if (existed) await runner.deleteNode(ns, L_TRACE, tid);
+  await runner.deleteNodes(ns, L_STEP, steps.map(idOf));
+  return existed || steps.length > 0;
 }
 
 async function deleteTraces(runner: Runner, ns: string, tids: Iterable<string>): Promise<number> {
@@ -3871,9 +3902,9 @@ export async function deleteRelation(
   const newest = newestEdge(await typedEdgeVersions(runner, ns, rid, isRelationType));
   if (newest === null) throw new NotFoundError("Relation", rid, undefined, { namespace: ns });
   const traceIds = await tracesTouchingRelations(runner, ns, [rid]);
+  const deletedDecisions = await deleteTraces(runner, ns, traceIds);
   const deletedVersions = await runner.deleteEdges(ns, rid);
   await deleteEvidence(runner, ns, rid);
-  const deletedDecisions = await deleteTraces(runner, ns, traceIds);
   const restored = await resettleEndpoints(runner, ns, [newest], caps, new Date());
   return {
     ...NO_DELETES,

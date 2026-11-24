@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from functools import partial
+from itertools import takewhile
 from typing import Any, NamedTuple, TypeVar, get_args
 
 from . import ids as _ids
@@ -1382,19 +1383,40 @@ async def _delete_steps(runner: Any, ns: str, tid: str) -> None:
         await runner.delete_node(ns, L_STEP, step["id"])
 
 
-async def _delete_trace_quietly(runner: Any, ns: str, tid: str) -> bool:
-    """Delete a decision trace and its steps when it still exists.
+async def _step_nodes(runner: Any, ns: str, tid: str) -> list[dict]:
+    """Read the step nodes of a decision trace by id, found even when the trace node is already gone.
 
     @param runner (Any): graph runner.
     @param ns (str): namespace.
     @param tid (str): trace id.
-    @return (bool): True when a trace was removed.
+    @return (list[dict]): the step nodes.
     """
-    if not await runner.node_exists(ns, L_TRACE, tid):
-        return False
-    await _delete_steps(runner, ns, tid)
-    await runner.delete_node(ns, L_TRACE, tid)
-    return True
+    prefix = _ids.step_id(tid, 0).removesuffix("0")
+    found: list[dict] = []
+    after = prefix
+    while True:
+        rows = await runner.match_nodes(ns, L_STEP, limit=_BATCH, id_gt=after)
+        mine = list(takewhile(lambda row: row["id"].startswith(prefix), rows))
+        found += [row for row in mine if _ids.trace_of_step(row["id"]) == tid]
+        if len(mine) < _BATCH:
+            return found
+        after = mine[-1]["id"]
+
+
+async def _delete_trace_quietly(runner: Any, ns: str, tid: str) -> bool:
+    """Delete a decision trace node, then its steps, which a step lookup still finds if the delete is cut off.
+
+    @param runner (Any): graph runner.
+    @param ns (str): namespace.
+    @param tid (str): trace id.
+    @return (bool): True when a trace node or a step was removed.
+    """
+    existed = await runner.node_exists(ns, L_TRACE, tid)
+    steps = await _step_nodes(runner, ns, tid)
+    if existed:
+        await runner.delete_node(ns, L_TRACE, tid)
+    await runner.delete_nodes(ns, L_STEP, [step["id"] for step in steps])
+    return existed or bool(steps)
 
 
 async def _traces_touching_relations(runner: Any, ns: str, rids: list[str]) -> set[str]:
@@ -3450,9 +3472,9 @@ async def delete_relation(
     if newest is None:
         raise NotFoundError("Relation", rid, namespace=ns)
     trace_ids = await _traces_touching_relations(runner, ns, [rid])
+    deleted_decisions = sum([await _delete_trace_quietly(runner, ns, tid) for tid in trace_ids])
     n = await runner.delete_edges(ns, rid)
     await _delete_evidence(runner, ns, rid)
-    deleted_decisions = sum([await _delete_trace_quietly(runner, ns, tid) for tid in trace_ids])
     restored = await resettle_endpoints(runner, ns, [newest], caps, now())
     return {
         **_NO_DELETES,
