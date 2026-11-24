@@ -18,6 +18,7 @@ from selfgraph import (
     Extraction,
     KuzuStore,
     Neo4jStore,
+    NotFoundError,
     Schema,
     SelfGraph,
     ValidationError,
@@ -3213,27 +3214,14 @@ CUT_WRITES = (
 )
 
 
-async def cut_decision_update(graph, rels, tid, picked, cut):
-    """Update a decision with its write at an index failed, retry the update, and read the decision back.
+async def cut_run(store, cut, action):
+    """Run an action with the store write at an index failed, and count the writes it made.
 
-    @param graph (SelfGraph): a graph on a Kuzu store holding the entities and relations.
-    @param rels (list[Relation]): the three relations to build steps from.
-    @param tid (str): the decision id.
-    @param picked (list[int] | None): the indexes of the relations to use as steps, or None to keep the steps.
+    @param store (KuzuStore): the store.
     @param cut (int | None): the index of the store write to fail, or None to fail none.
-    @return (tuple[int, dict]): the number of store writes the first update made, and what is stored after the retry.
+    @param action (Callable[[], Awaitable]): the call under test.
+    @return (int): the number of store writes the action made.
     """
-    store, ns = graph.store, graph.namespace
-    await graph.decisions.create(
-        "Pick",
-        id=tid,
-        steps=[rels[0].id, rels[1].id],
-        actor_entity="team:core",
-        outcome_entity="company:hydradb",
-        alternative_entities=["company:neo4j"],
-        rationale="old",
-    )
-    change = {"rationale": "new", **({} if picked is None else {"steps": [rels[i].id for i in picked]})}
     calls = []
 
     def counting(name):
@@ -3259,12 +3247,37 @@ async def cut_decision_update(graph, rels, tid, picked, cut):
     for name in CUT_WRITES:
         setattr(store, name, counting(name))
     try:
-        await graph.decisions.update(tid, **change)
+        await action()
     except ConnectionError:
         pass
     finally:
         for name in CUT_WRITES:
             delattr(store, name)
+    return len(calls)
+
+
+async def cut_decision_update(graph, rels, tid, picked, cut):
+    """Update a decision with its write at an index failed, retry the update, and read the decision back.
+
+    @param graph (SelfGraph): a graph on a Kuzu store holding the entities and relations.
+    @param rels (list[Relation]): the three relations to build steps from.
+    @param tid (str): the decision id.
+    @param picked (list[int] | None): the indexes of the relations to use as steps, or None to keep the steps.
+    @param cut (int | None): the index of the store write to fail, or None to fail none.
+    @return (tuple[int, dict]): the number of store writes the first update made, and what is stored after the retry.
+    """
+    store, ns = graph.store, graph.namespace
+    await graph.decisions.create(
+        "Pick",
+        id=tid,
+        steps=[rels[0].id, rels[1].id],
+        actor_entity="team:core",
+        outcome_entity="company:hydradb",
+        alternative_entities=["company:neo4j"],
+        rationale="old",
+    )
+    change = {"rationale": "new", **({} if picked is None else {"steps": [rels[i].id for i in picked]})}
+    writes = await cut_run(store, cut, lambda: graph.decisions.update(tid, **change))
     await graph.decisions.update(tid, **change)
     decision = await graph.decisions.get(tid)
     sids = [ids.step_id(tid, order) for order in range(3)]
@@ -3276,7 +3289,7 @@ async def cut_decision_update(graph, rels, tid, picked, cut):
         (_serde.L_ENTITY, _serde.L_TRACE, {"to_in": [tid]}),
     ):
         edges += await store.match_edges(ns, from_label=source, to_label=target, **where)
-    return len(calls), {
+    return writes, {
         "rationale": decision.rationale,
         "steps": [[s.order, s.relation_id, s.from_entity, s.to_entity] for s in decision.steps],
         "step_nodes": [sid.replace(tid, "T") for sid in sids if await store.node_exists(ns, _serde.L_STEP, sid)],
@@ -3310,10 +3323,74 @@ async def cut_decision_updates():
     return out
 
 
+async def cut_decision_delete(store, ns, target, cut):
+    """Delete with the store write at an index failed, retry the delete, and read back what is left.
+
+    @param store (KuzuStore): the store.
+    @param ns (str): a fresh namespace.
+    @param target (str): what to delete: "relation", "entity", "actor", or "decision".
+    @param cut (int | None): the index of the store write to fail, or None to fail none.
+    @return (tuple[int, dict]): the number of store writes the first delete made, and what is left after the retry.
+    """
+    graph = SelfGraph(store=store, namespace=ns)
+    await graph.initialize()
+    for name in ("Acme", "Beta", "Gamma"):
+        await graph.entities.create(name, "Org")
+    await graph.entities.create("Bob", "Person")
+    first = await graph.relations.create("org:acme", "OWNS", "org:beta")
+    second = await graph.relations.create("org:acme", "OWNS", "org:gamma")
+    await graph.decisions.create("Buy", id="decision:d1", steps=[first.id, second.id], actor_entity="person:bob")
+
+    def remove():
+        """Start the delete under test.
+
+        @return (Awaitable): the delete.
+        """
+        if target == "relation":
+            return graph.relations.delete(first.id)
+        if target == "entity":
+            return graph.entities.delete("org:beta")
+        if target == "actor":
+            return graph.entities.delete("person:bob")
+        return graph.decisions.delete("decision:d1")
+
+    writes = await cut_run(store, cut, remove)
+    try:
+        await remove()
+    except NotFoundError:
+        pass
+    return writes, {
+        "decisions": [d.id for d in (await graph.decisions.list()).items],
+        "step_nodes": sorted(n["id"] for n in await store.match_nodes(ns, _serde.L_STEP)),
+        "relations": sorted(r.id for r in (await graph.relations.list()).items),
+        "entities": sorted(e.id for e in (await graph.entities.list()).items),
+    }
+
+
+async def cut_decision_deletes():
+    """Cut each delete that removes a decision at every store write, retry it, and read back what is left.
+
+    @return (dict): per delete, what a clean delete leaves, and the indexes of the cuts whose retry left anything else.
+    """
+    import tempfile
+
+    store = KuzuStore(os.path.join(tempfile.mkdtemp(prefix="sg-conf-cut-"), "g.kuzu"))
+    out = {}
+    for target in ("relation", "entity", "actor", "decision"):
+        writes, whole = await cut_decision_delete(store, f"{target}-clean", target, None)
+        cuts = [await cut_decision_delete(store, f"{target}-{cut}", target, cut) for cut in range(writes)]
+        out[target] = {"whole": whole, "failed_cuts": [cut for cut, (_, state) in enumerate(cuts) if state != whole]}
+    await store.close()
+    return out
+
+
 async def main():
     cmd = sys.argv[1]
     if cmd == "kuzu_cut_update":
         json.dump(await cut_decision_updates(), sys.stdout)
+        return
+    if cmd == "kuzu_cut_delete":
+        json.dump(await cut_decision_deletes(), sys.stdout)
         return
     if cmd == "exit_codes":
         json.dump(exit_codes(), sys.stdout)

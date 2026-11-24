@@ -1283,40 +1283,77 @@ export async function listEntities(
   return found.slice(args.skip, args.skip + args.limit).map(decodeEntity);
 }
 
-async function deleteSteps(runner: Runner, ns: string, tid: string): Promise<void> {
-  for (const step of await runner.childNodes(ns, L_TRACE, tid, R_HAS_STEP, L_STEP)) {
-    await runner.deleteNode(ns, L_STEP, idOf(step));
+/**
+ * Delete a decision's steps no lookup can find, then its trace node, then the steps the lookup found.
+ *
+ * A cut-off delete then leaves either a trace the lookup still reaches through the steps it found, or a trace with no
+ * steps that an actor or outcome lookup reaches.
+ *
+ * @param runner (Runner): the graph runner.
+ * @param ns (string): the namespace.
+ * @param tid (string): the trace id.
+ * @param found (ReadonlySet<string>): ids of the trace's steps the lookup that found it returned.
+ * @return (boolean): true when a trace node or a found step was removed.
+ */
+export async function deleteTraceQuietly(
+  runner: Runner,
+  ns: string,
+  tid: string,
+  found: ReadonlySet<string> = new Set(),
+): Promise<boolean> {
+  const existed = await runner.nodeExists(ns, L_TRACE, tid);
+  if (existed) {
+    const steps = await runner.childNodes(ns, L_TRACE, tid, R_HAS_STEP, L_STEP);
+    await runner.deleteNodes(
+      ns,
+      L_STEP,
+      steps.map(idOf).filter((sid) => !found.has(sid)),
+    );
+    await runner.deleteNode(ns, L_TRACE, tid);
   }
+  await runner.deleteNodes(ns, L_STEP, [...found].sort(comparePy));
+  return existed || found.size > 0;
 }
 
-export async function deleteTraceQuietly(runner: Runner, ns: string, tid: string): Promise<boolean> {
-  if (!(await runner.nodeExists(ns, L_TRACE, tid))) return false;
-  await deleteSteps(runner, ns, tid);
-  await runner.deleteNode(ns, L_TRACE, tid);
-  return true;
-}
-
-async function deleteTraces(runner: Runner, ns: string, tids: Iterable<string>): Promise<number> {
+/**
+ * Delete decision traces in id order, each with the ids of its steps a lookup found.
+ *
+ * @param runner (Runner): the graph runner.
+ * @param ns (string): the namespace.
+ * @param traces (ReadonlyMap<string, ReadonlySet<string>>): each trace id and its found step ids.
+ * @return (number): how many traces had a node or a found step removed.
+ */
+async function deleteTraces(
+  runner: Runner,
+  ns: string,
+  traces: ReadonlyMap<string, ReadonlySet<string>>,
+): Promise<number> {
   let deleted = 0;
-  for (const tid of tids) if (await deleteTraceQuietly(runner, ns, tid)) deleted += 1;
+  for (const tid of [...traces.keys()].sort(comparePy)) {
+    if (await deleteTraceQuietly(runner, ns, tid, traces.get(tid)!)) deleted += 1;
+  }
   return deleted;
 }
 
 /**
- * Find decision traces that use any of some relations as one of their steps.
+ * Find decision traces that use any of some relations as one of their steps, with the steps that matched.
  *
  * @param runner (Runner): the graph runner.
  * @param ns (string): the namespace.
  * @param rids (readonly string[]): the relation ids.
- * @return (Set<string>): the owning trace ids.
+ * @return (Map<string, Set<string>>): each owning trace id and the ids of its matching steps.
  */
 export async function tracesTouchingRelations(
   runner: Runner,
   ns: string,
   rids: readonly string[],
-): Promise<Set<string>> {
-  const steps = await nodesWhere(runner, ns, L_STEP, "relation_id", rids);
-  return new Set(steps.map((step) => ids.traceOfStep(idOf(step))));
+): Promise<Map<string, Set<string>>> {
+  const found = new Map<string, Set<string>>();
+  for (const step of await nodesWhere(runner, ns, L_STEP, "relation_id", rids)) {
+    const tid = ids.traceOfStep(idOf(step));
+    found.set(tid, (found.get(tid) ?? new Set<string>()).add(idOf(step)));
+  }
+  return found;
 }
 
 /**
@@ -1325,10 +1362,15 @@ export async function tracesTouchingRelations(
  * @param runner (Runner): the graph runner.
  * @param ns (string): the namespace.
  * @param eids (readonly string[]): the entity ids.
- * @return (Set<string>): the referencing trace ids.
+ * @return (Map<string, Set<string>>): each referencing trace id and the ids of its steps that matched, none when only
+ *   the trace node does.
  */
-async function tracesTouchingEntities(runner: Runner, ns: string, eids: readonly string[]): Promise<Set<string>> {
-  const tids = new Set<string>();
+async function tracesTouchingEntities(
+  runner: Runner,
+  ns: string,
+  eids: readonly string[],
+): Promise<Map<string, Set<string>>> {
+  const found = new Map<string, Set<string>>();
   const lookups: Array<[string, string[]]> = [
     [L_TRACE, ["actor_entity", "outcome_entity"]],
     [L_STEP, ["from_entity", "to_entity"]],
@@ -1336,11 +1378,14 @@ async function tracesTouchingEntities(runner: Runner, ns: string, eids: readonly
   for (const [label, keys] of lookups) {
     for (const key of keys) {
       for (const node of await nodesWhere(runner, ns, label, key, eids)) {
-        tids.add(label === L_TRACE ? idOf(node) : ids.traceOfStep(idOf(node)));
+        const tid = label === L_TRACE ? idOf(node) : ids.traceOfStep(idOf(node));
+        const steps = found.get(tid) ?? new Set<string>();
+        if (label === L_STEP) steps.add(idOf(node));
+        found.set(tid, steps);
       }
     }
   }
-  return tids;
+  return found;
 }
 
 /**
@@ -1558,12 +1603,14 @@ export async function deleteEntities(
   }
   const rids = dedupList([...seen.values()]);
   counts.deleted_relation_versions = seen.size;
-  const traceIds = await tracesTouchingEntities(runner, ns, eids);
-  for (const tid of await tracesTouchingRelations(runner, ns, rids)) traceIds.add(tid);
-  counts.deleted_decisions = await deleteTraces(runner, ns, [...traceIds].sort(comparePy));
+  const traces = await tracesTouchingEntities(runner, ns, eids);
+  for (const [tid, steps] of await tracesTouchingRelations(runner, ns, rids)) {
+    traces.set(tid, new Set([...(traces.get(tid) ?? []), ...steps]));
+  }
+  counts.deleted_decisions = await deleteTraces(runner, ns, traces);
   const alternatives = [...(await tracesWithAlternatives(runner, ns, eids))].sort(([a], [b]) => comparePy(a, b));
   for (const [tid, alts] of alternatives) {
-    if (!traceIds.has(tid)) await pruneTraceAlternatives(runner, ns, tid, alts);
+    if (!traces.has(tid)) await pruneTraceAlternatives(runner, ns, tid, alts);
   }
 
   const profiles = [...(await nodesById(runner, ns, L_PROFILE, eids.map(ids.profileId))).keys()];
@@ -3876,10 +3923,9 @@ export async function deleteRelation(
   requireStr("relation id", rid);
   const newest = newestEdge(await typedEdgeVersions(runner, ns, rid, isRelationType));
   if (newest === null) throw new NotFoundError("Relation", rid, undefined, { namespace: ns });
-  const traceIds = await tracesTouchingRelations(runner, ns, [rid]);
+  const deletedDecisions = await deleteTraces(runner, ns, await tracesTouchingRelations(runner, ns, [rid]));
   const deletedVersions = await runner.deleteEdges(ns, rid);
   await deleteEvidence(runner, ns, rid);
-  const deletedDecisions = await deleteTraces(runner, ns, traceIds);
   const restored = await resettleEndpoints(runner, ns, [newest], caps, new Date());
   return {
     ...NO_DELETES,

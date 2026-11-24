@@ -1,5 +1,5 @@
-import { expect, it } from "vitest";
-import { ids, ValidationError } from "../src/index.js";
+import { expect, it, vi } from "vitest";
+import { ids, NotFoundError, ValidationError } from "../src/index.js";
 import { L_ENTITY, L_STEP, L_TRACE } from "../src/labels.js";
 import { countStoreWrites, forEachStore, freshGraphs, type StoreSpec } from "./helpers.js";
 
@@ -67,6 +67,79 @@ function suite(spec: StoreSpec): void {
           await g.decisions.update("decision:d1", change);
           expect(await state(g), `cut at write ${cut}: ${writes[cut]}`).toEqual(whole);
         }
+      },
+    );
+  }
+  const deleteSetup = async (target: "relation" | "entity") => {
+    const g = open();
+    for (const name of ["Acme", "Beta", "Gamma"]) await g.entities.create(name, "Org");
+    await g.entities.create("Bob", "Person");
+    const first = await g.relations.create("org:acme", "OWNS", "org:beta");
+    const second = await g.relations.create("org:acme", "OWNS", "org:gamma");
+    await g.decisions.create("Buy", { id: "decision:d1", steps: [first.id, second.id], actor_entity: "person:bob" });
+    const remove = () => {
+      if (target === "relation") return g.relations.delete(first.id);
+      return g.entities.delete("org:beta");
+    };
+    return { g, remove };
+  };
+  const leftAfterDelete = async (g: ReturnType<typeof open>) => ({
+    decisions: (await g.decisions.list()).items.map((d) => d.id),
+    step_nodes: (await g.store.matchNodes(g.namespace, L_STEP)).map((n) => n.id as string).sort(),
+    relations: (await g.relations.list()).items.map((r) => r.id).sort(),
+    entities: (await g.entities.list()).items.map((e) => e.id).sort(),
+  });
+  for (const target of ["relation", "entity"] as const) {
+    it.runIf(!spec.transactional)(
+      `leaves no decision behind when a ${target} delete is cut off at any write and retried`,
+      async () => {
+        const clean = await deleteSetup(target);
+        const writes = await countStoreWrites(clean.g, null, async () => {
+          await clean.remove();
+        });
+        const whole = await leftAfterDelete(clean.g);
+        expect(whole.decisions).toEqual([]);
+        expect(whole.step_nodes).toEqual([]);
+        for (let cut = 0; cut < writes.length; cut++) {
+          const { g, remove } = await deleteSetup(target);
+          await countStoreWrites(g, cut, async () => {
+            await expect(remove()).rejects.toThrow("connection lost");
+          });
+          await remove().catch((error) => {
+            if (!(error instanceof NotFoundError)) throw error;
+          });
+          expect(await leftAfterDelete(g), `cut at write ${cut}: ${writes[cut]}`).toEqual(whole);
+        }
+      },
+    );
+  }
+  for (const target of ["relation", "entity"] as const) {
+    it.runIf(!spec.transactional)(
+      `removes the steps and counts the decision when a ${target} delete is retried after the trace node is gone`,
+      async () => {
+        const { g, remove } = await deleteSetup(target);
+        let traceGone = false;
+        const store = g.store as unknown as Record<
+          string,
+          (ns: string, label: string, ...rest: unknown[]) => Promise<void>
+        >;
+        const spies = ["deleteNode", "deleteNodes"].map((name) => {
+          const real = store[name]!.bind(g.store);
+          return vi.spyOn(store, name).mockImplementation(async (ns, label, ...rest) => {
+            if (label === L_STEP && traceGone) throw new Error("connection lost");
+            await real(ns, label, ...rest);
+            if (label === L_TRACE) traceGone = true;
+          });
+        });
+        try {
+          await expect(remove()).rejects.toThrow("connection lost");
+        } finally {
+          for (const spy of spies) spy.mockRestore();
+        }
+        expect(await g.decisions.get("decision:d1")).toBeNull();
+        expect((await leftAfterDelete(g)).step_nodes).not.toEqual([]);
+        expect((await remove()).deleted_decisions).toBe(1);
+        expect((await leftAfterDelete(g)).step_nodes).toEqual([]);
       },
     );
   }

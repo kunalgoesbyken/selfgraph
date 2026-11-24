@@ -13,6 +13,7 @@ import {
   ids,
   KuzuStore,
   Neo4jStore,
+  NotFoundError,
   SelfGraph,
   SelfGraphError,
   toJsonable,
@@ -1283,6 +1284,35 @@ const CUT_WRITES = [
   "deleteEdgesTouchingByType",
 ] as const;
 
+/**
+ * Run an action with the store write at an index failed, and count the writes it made.
+ *
+ * @param store (GraphStore): the store.
+ * @param cut (number | null): the index of the store write to fail, or null to fail none.
+ * @param action (() => Promise<unknown>): the call under test.
+ * @return (Promise<number>): the number of store writes the action made.
+ */
+async function cutRun(store: GraphStore, cut: number | null, action: () => Promise<unknown>): Promise<number> {
+  const calls: string[] = [];
+  const target = store as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+  const originals = CUT_WRITES.map((name) => target[name]!.bind(store));
+  CUT_WRITES.forEach((name, k) => {
+    target[name] = async (...args: unknown[]) => {
+      calls.push(name);
+      if (calls.length - 1 === cut) throw new Error("connection lost");
+      return originals[k]!(...args);
+    };
+  });
+  try {
+    await action();
+  } catch (exc) {
+    if (!(exc instanceof Error) || exc.message !== "connection lost") throw exc;
+  } finally {
+    for (const name of CUT_WRITES) delete target[name];
+  }
+  return calls.length;
+}
+
 interface CutState {
   rationale: string | null;
   steps: unknown[][];
@@ -1318,23 +1348,7 @@ async function cutDecisionUpdate(
     rationale: "old",
   });
   const change = { rationale: "new", ...(picked === null ? {} : { steps: picked.map((i) => rels[i]!.id) }) };
-  const calls: string[] = [];
-  const target = store as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
-  const originals = CUT_WRITES.map((name) => target[name]!.bind(store));
-  CUT_WRITES.forEach((name, k) => {
-    target[name] = async (...args: unknown[]) => {
-      calls.push(name);
-      if (calls.length - 1 === cut) throw new Error("connection lost");
-      return originals[k]!(...args);
-    };
-  });
-  try {
-    await graph.decisions.update(tid, change);
-  } catch (exc) {
-    if (!(exc instanceof Error) || exc.message !== "connection lost") throw exc;
-  } finally {
-    for (const name of CUT_WRITES) delete target[name];
-  }
+  const writes = await cutRun(store, cut, () => graph.decisions.update(tid, change));
   await graph.decisions.update(tid, change);
   const decision = (await graph.decisions.get(tid))!;
   const sids = [0, 1, 2].map((order) => ids.stepId(tid, order));
@@ -1350,7 +1364,7 @@ async function cutDecisionUpdate(
   const stored: string[] = [];
   for (const sid of sids) if (await store.nodeExists(ns, "DecisionStep", sid)) stored.push(sid.replaceAll(tid, "T"));
   return [
-    calls.length,
+    writes,
     {
       rationale: decision.rationale,
       steps: decision.steps.map((s) => [s.order, s.relation_id, s.from_entity, s.to_entity]),
@@ -1399,6 +1413,83 @@ export async function cutDecisionUpdates(
       if (!isDeepStrictEqual(state, whole)) failed_cuts.push(cut);
     }
     out[name] = { whole, failed_cuts };
+  }
+  await store.close();
+  await KuzuStore.closeDatabase(path);
+  return out;
+}
+
+interface CutLeft {
+  decisions: string[];
+  step_nodes: string[];
+  relations: string[];
+  entities: string[];
+}
+
+/**
+ * Delete with the store write at an index failed, retry the delete, and read back what is left.
+ *
+ * @param store (KuzuStore): the store.
+ * @param ns (string): a fresh namespace.
+ * @param target ("relation" | "entity" | "actor" | "decision"): what to delete.
+ * @param cut (number | null): the index of the store write to fail, or null to fail none.
+ * @return (Promise<[number, CutLeft]>): the number of store writes the first delete made, and what is left after the retry.
+ */
+async function cutDecisionDelete(
+  store: KuzuStore,
+  ns: string,
+  target: "relation" | "entity" | "actor" | "decision",
+  cut: number | null,
+): Promise<[number, CutLeft]> {
+  const graph = new SelfGraph(store, { namespace: ns });
+  await graph.initialize();
+  for (const name of ["Acme", "Beta", "Gamma"]) await graph.entities.create(name, "Org");
+  await graph.entities.create("Bob", "Person");
+  const first = await graph.relations.create("org:acme", "OWNS", "org:beta");
+  const second = await graph.relations.create("org:acme", "OWNS", "org:gamma");
+  await graph.decisions.create("Buy", { id: "decision:d1", steps: [first.id, second.id], actor_entity: "person:bob" });
+  const remove = () => {
+    if (target === "relation") return graph.relations.delete(first.id);
+    if (target === "entity") return graph.entities.delete("org:beta");
+    if (target === "actor") return graph.entities.delete("person:bob");
+    return graph.decisions.delete("decision:d1");
+  };
+  const writes = await cutRun(store, cut, remove);
+  try {
+    await remove();
+  } catch (exc) {
+    if (!(exc instanceof NotFoundError)) throw exc;
+  }
+  return [
+    writes,
+    {
+      decisions: (await graph.decisions.list()).items.map((d) => d.id),
+      step_nodes: (await store.matchNodes(ns, "DecisionStep")).map((n) => n.id as string).sort(),
+      relations: (await graph.relations.list()).items.map((r) => r.id).sort(),
+      entities: (await graph.entities.list()).items.map((e) => e.id).sort(),
+    },
+  ];
+}
+
+/**
+ * Cut each delete that removes a decision at every store write, retry it, and read back what is left.
+ *
+ * @param path (string): a fresh Kuzu database path.
+ * @return (Promise<Record<string, { whole: CutLeft; failed_cuts: number[] }>>): per delete, what a clean delete leaves, and the indexes of the cuts whose retry left anything else.
+ */
+export async function cutDecisionDeletes(
+  path: string,
+): Promise<Record<string, { whole: CutLeft; failed_cuts: number[] }>> {
+  const store = new KuzuStore(path);
+  const out: Record<string, { whole: CutLeft; failed_cuts: number[] }> = {};
+  for (const target of ["relation", "entity", "actor", "decision"] as const) {
+    const [writes, whole] = await cutDecisionDelete(store, `${target}-clean`, target, null);
+    const failed_cuts: number[] = [];
+    for (let cut = 0; cut < writes; cut++) {
+      const [, left] = await cutDecisionDelete(store, `${target}-${cut}`, target, cut);
+      if (!isDeepStrictEqual(left, whole)) failed_cuts.push(cut);
+    }
+    out[target] = { whole, failed_cuts };
   }
   await store.close();
   await KuzuStore.closeDatabase(path);

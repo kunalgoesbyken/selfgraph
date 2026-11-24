@@ -1821,7 +1821,7 @@ export async function unmerge(
       evidence: [],
     };
     const backId = ridOf(back);
-    let touching = new Set<string>();
+    let touching = new Map<string, Set<string>>();
     const reused = backId === rw.id && !rw.dropped;
     const keep = !reused && (rw.existed || split.sources.size > 0 || backedElsewhere(rw, rec, siblings));
     if (keep && !rw.existed) handed.add(JSON.stringify([rw.kind, rw.id]));
@@ -1865,7 +1865,7 @@ export async function unmerge(
     origRestored.set(ridOf(original), rel!.id);
     relations.push(rel!);
     moved.push([rw, { ...rw, id: rel!.id, rewritten: dumpRelation(back), existed, dropped: false }]);
-    await ops.repointSteps(runner, ns, touching, deleted);
+    await ops.repointSteps(runner, ns, touching.keys(), deleted);
   }
 
   const slots = (rel: Relation): Set<string> =>

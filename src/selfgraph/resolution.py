@@ -1631,7 +1631,7 @@ async def unmerge(runner: Any, ns: str, merge_id: str, caps: Mapping[str, Any] |
             event_time=event_time,
         )
         back_id = back.id or _ids.relation_id(back.from_entity, back.type, back.to_entity)
-        touching: set[str] = set()
+        touching: dict[str, set[str]] = {}
         reused = back_id == rw.id and not rw.dropped
         kept = not reused and (rw.existed or bool(split.sources) or _backed_elsewhere(rw, rec, siblings))
         if kept and not rw.existed:

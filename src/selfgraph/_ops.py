@@ -1376,51 +1376,72 @@ async def list_entities(
     return [decode_entity(r) for r in found[skip : skip + limit]]
 
 
-async def _delete_steps(runner: Any, ns: str, tid: str) -> None:
-    for step in await runner.child_nodes(ns, L_TRACE, tid, R_HAS_STEP, L_STEP):
-        await runner.delete_node(ns, L_STEP, step["id"])
+async def _delete_trace_quietly(runner: Any, ns: str, tid: str, found: Collection[str] = ()) -> bool:
+    """Delete a decision's steps no lookup can find, then its trace node, then the steps the lookup found.
 
-
-async def _delete_trace_quietly(runner: Any, ns: str, tid: str) -> bool:
-    """Delete a decision trace and its steps when it still exists.
+    A cut-off delete then leaves either a trace the lookup still reaches through the steps it found, or a trace with
+    no steps that an actor or outcome lookup reaches.
 
     @param runner (Any): graph runner.
     @param ns (str): namespace.
     @param tid (str): trace id.
-    @return (bool): True when a trace was removed.
+    @param found (Collection[str]): ids of the trace's steps the lookup that found it returned.
+    @return (bool): True when a trace node or a found step was removed.
     """
-    if not await runner.node_exists(ns, L_TRACE, tid):
-        return False
-    await _delete_steps(runner, ns, tid)
-    await runner.delete_node(ns, L_TRACE, tid)
-    return True
+    existed = await runner.node_exists(ns, L_TRACE, tid)
+    if existed:
+        hidden = [
+            s["id"] for s in await runner.child_nodes(ns, L_TRACE, tid, R_HAS_STEP, L_STEP) if s["id"] not in found
+        ]
+        await runner.delete_nodes(ns, L_STEP, hidden)
+        await runner.delete_node(ns, L_TRACE, tid)
+    await runner.delete_nodes(ns, L_STEP, sorted(found))
+    return existed or bool(found)
 
 
-async def _traces_touching_relations(runner: Any, ns: str, rids: list[str]) -> set[str]:
-    """Find decision traces that use any of some relations as one of their steps.
+async def _delete_traces(runner: Any, ns: str, traces: Mapping[str, Collection[str]]) -> int:
+    """Delete decision traces in id order, each with the ids of its steps a lookup found.
+
+    @param runner (Any): graph runner.
+    @param ns (str): namespace.
+    @param traces (Mapping[str, Collection[str]]): each trace id and its found step ids.
+    @return (int): how many traces had a node or a found step removed.
+    """
+    return sum([await _delete_trace_quietly(runner, ns, tid, traces[tid]) for tid in sorted(traces)])
+
+
+async def _traces_touching_relations(runner: Any, ns: str, rids: list[str]) -> dict[str, set[str]]:
+    """Find decision traces that use any of some relations as one of their steps, with the steps that matched.
 
     @param runner (Any): graph runner.
     @param ns (str): namespace.
     @param rids (list[str]): relation ids.
-    @return (set[str]): owning trace ids.
+    @return (dict[str, set[str]]): each owning trace id and the ids of its matching steps.
     """
-    return {_ids.trace_of_step(s["id"]) for s in await _nodes_where(runner, ns, L_STEP, "relation_id", rids)}
+    found: dict[str, set[str]] = {}
+    for step in await _nodes_where(runner, ns, L_STEP, "relation_id", rids):
+        found.setdefault(_ids.trace_of_step(step["id"]), set()).add(step["id"])
+    return found
 
 
-async def _traces_touching_entities(runner: Any, ns: str, eids: list[str]) -> set[str]:
+async def _traces_touching_entities(runner: Any, ns: str, eids: list[str]) -> dict[str, set[str]]:
     """Find decision traces that reference any of some entities as actor, outcome, or step endpoint.
 
     @param runner (Any): graph runner.
     @param ns (str): namespace.
     @param eids (list[str]): entity ids.
-    @return (set[str]): referencing trace ids.
+    @return (dict[str, set[str]]): each referencing trace id and the ids of its steps that matched, none when only the
+        trace node does.
     """
-    tids: set[str] = set()
+    found: dict[str, set[str]] = {}
     for label, keys in ((L_TRACE, ("actor_entity", "outcome_entity")), (L_STEP, ("from_entity", "to_entity"))):
         for key in keys:
-            nodes = await _nodes_where(runner, ns, label, key, eids)
-            tids |= {n["id"] if label == L_TRACE else _ids.trace_of_step(n["id"]) for n in nodes}
-    return tids
+            for node in await _nodes_where(runner, ns, label, key, eids):
+                if label == L_TRACE:
+                    found.setdefault(node["id"], set())
+                else:
+                    found.setdefault(_ids.trace_of_step(node["id"]), set()).add(node["id"])
+    return found
 
 
 async def _repoint_steps(runner: Any, ns: str, tids: Iterable[str], moved: Mapping[str, str]) -> None:
@@ -1551,13 +1572,15 @@ async def delete_entities(
     seen = {(edge["props"]["id"], _revision(edge)) for edge in versions}
     rids = _dedup_list(rid for rid, _ in seen)
     counts["deleted_relation_versions"] = len(seen)
-    trace_ids = await _traces_touching_entities(runner, ns, eids) | await _traces_touching_relations(runner, ns, rids)
-    counts["deleted_decisions"] = sum([await _delete_trace_quietly(runner, ns, tid) for tid in sorted(trace_ids)])
+    traces = await _traces_touching_entities(runner, ns, eids)
+    for tid, steps in (await _traces_touching_relations(runner, ns, rids)).items():
+        traces.setdefault(tid, set()).update(steps)
+    counts["deleted_decisions"] = await _delete_traces(runner, ns, traces)
     considered: dict[str, set[str]] = {}
     for edge in await _edges_into(runner, ns, L_TRACE, L_ENTITY, "to_in", eids, type=R_CONSIDERED):
         considered.setdefault(edge["from_id"], set()).add(edge["to_id"])
     for tid, alternatives in sorted(considered.items()):
-        trace = None if tid in trace_ids else await get_trace(runner, ns, tid)
+        trace = None if tid in traces else await get_trace(runner, ns, tid)
         if trace is not None:
             remaining = [a for a in trace.alternative_entities if a not in alternatives]
             if remaining != list(trace.alternative_entities):
@@ -3454,10 +3477,9 @@ async def delete_relation(
     newest = await _newest_edge(runner, ns, rid, _is_relation_type)
     if newest is None:
         raise NotFoundError("Relation", rid, namespace=ns)
-    trace_ids = await _traces_touching_relations(runner, ns, [rid])
+    deleted_decisions = await _delete_traces(runner, ns, await _traces_touching_relations(runner, ns, [rid]))
     n = await runner.delete_edges(ns, rid)
     await _delete_evidence(runner, ns, rid)
-    deleted_decisions = sum([await _delete_trace_quietly(runner, ns, tid) for tid in trace_ids])
     restored = await resettle_endpoints(runner, ns, [newest], caps, now())
     return {
         **_NO_DELETES,
