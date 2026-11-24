@@ -2277,6 +2277,37 @@ export class Contradictions {
     return [by, effective];
   }
 
+  /**
+   * The earliest displacement of a retired relation across the endpoints its retiring relation shares with it.
+   *
+   * @param rid (string): the retired relation id.
+   * @param by (string): the relation that retired it.
+   * @param found ([string, Date]): the displacing relation id and time at the endpoint being settled.
+   * @param key (string): the endpoint being settled, as JSON.
+   * @param retired (ReadonlyMap<string, [string, Date]>): pending retirements from the current settle run.
+   * @return ([string, Date]): the displacing relation id and the earliest displacement time.
+   */
+  private sharedDisplacement(
+    rid: string,
+    by: string,
+    found: [string, Date],
+    key: string,
+    retired: ReadonlyMap<string, [string, Date]>,
+  ): [string, Date] {
+    const version = this.versions.get(rid)!.at(-1)!;
+    for (const [slot, limit] of capSlots(this.caps, version.type, version.from_entity, version.to_entity)) {
+      const other = JSON.stringify(slot);
+      const facts = new Map([...(this.past.get(other) ?? []), ...(this.groups.get(other) ?? [])]);
+      if (other === key || !facts.has(by)) continue;
+      const newer = this.newer(facts, rid);
+      if (newer.length < limit) continue;
+      const windows = new Map([...facts.keys()].map((fact) => [fact, this.factWindows(fact, retired)]));
+      const displaced = this.displacedAt(newer, limit, rid, windows);
+      if (epochMicros(displaced[1]) < epochMicros(found[1])) found = displaced;
+    }
+    return found;
+  }
+
   private seat(slot: Slot, rid: string, rank: Rank, effective: Date): void {
     const key = JSON.stringify(slot);
     const group = this.groups.get(key) ?? new Map<string, Rank>();
@@ -2412,7 +2443,13 @@ export class Contradictions {
         const newer = this.newer(facts, rid);
         const ended = retired.get(rid) ?? this.ended.get(rid);
         if (ended === undefined || newer.length < limit) continue;
-        const [by, at] = this.displacedAt(newer, limit, rid, windows);
+        const [by, at] = this.sharedDisplacement(
+          rid,
+          ended[0],
+          this.displacedAt(newer, limit, rid, windows),
+          key,
+          retired,
+        );
         if (
           (by !== ended[0] || epochMicros(at) !== epochMicros(ended[1])) &&
           (facts.has(ended[0]) || epochMicros(at) < epochMicros(ended[1]))
@@ -2463,7 +2500,8 @@ export class Contradictions {
  * @param ns (string): the namespace.
  * @param caps (ReadonlyMap<string, RelationCap>): the max_count limits by normalized relation type and alias.
  * @param ends (Iterable<readonly [string, string, string]>): (normalized type, source id, destination id) of each write.
- * @param every (Map<string, EdgeRow[]> | undefined): receives every version read, by relation id, when given.
+ * @param every (Map<string, EdgeRow[]>): receives every version read, by relation id.
+ * @param twins (boolean): also read, and lock, the other endpoint of a relation retired by one with the same endpoints.
  * @return ([Map<string, EdgeRow>, Map<string, EdgeRow>]): each current relation's edge row by id, in read order, and the newest version of each relation a contradiction retired there by id.
  */
 async function constrainedCurrent(
@@ -2471,9 +2509,34 @@ async function constrainedCurrent(
   ns: string,
   caps: ReadonlyMap<string, RelationCap>,
   ends: Iterable<readonly [string, string, string]>,
-  every?: Map<string, EdgeRow[]>,
+  every: Map<string, EdgeRow[]>,
+  twins: boolean,
 ): Promise<[Map<string, EdgeRow>, Map<string, EdgeRow>]> {
-  const rows = [...(await endpointEdges(runner, ns, caps, ends, every)).values()];
+  const writes = [...ends];
+  const seen = new Set<string>();
+  const found = await endpointEdges(runner, ns, caps, writes, every, seen);
+  if (twins) {
+    const shared: Array<[string, string, string]> = [];
+    for (const e of found.values()) {
+      const twin = typeof e.props.invalidated_by === "string" ? found.get(e.props.invalidated_by) : undefined;
+      if (
+        !e.props.is_current &&
+        twin?.from_id === e.from_id &&
+        twin.to_id === e.to_id &&
+        capSlots(caps, e.type, e.from_id, e.to_id).length > 1
+      ) {
+        shared.push([e.type, e.from_id, e.to_id]);
+      }
+    }
+    const locked = new Set(relationLockIds(caps, writes));
+    for (const eid of relationLockIds(caps, shared)) {
+      if (!locked.has(eid)) await runner.lockNode(ns, L_ENTITY, eid);
+    }
+    for (const [rid, edge] of await endpointEdges(runner, ns, caps, shared, every, seen)) {
+      if (!found.has(rid)) found.set(rid, edge);
+    }
+  }
+  const rows = [...found.values()];
   return [
     new Map(rows.filter((e) => e.props.is_current).map((e) => [idOf(e.props), e])),
     new Map(
@@ -2497,6 +2560,7 @@ async function constrainedCurrent(
  * @param caps (ReadonlyMap<string, RelationCap>): the schema's max_count limits by relation type.
  * @param ends (Iterable<readonly [string, string, string]>): (normalized type, source id, destination id) of each relation.
  * @param every (Map<string, EdgeRow[]> | undefined): receives every version read, by relation id, when given.
+ * @param seen (Set<string>): the reads already made, as JSON [side, endpoint, stored type], which are skipped and added to.
  * @return (Map<string, EdgeRow>): each relation's newest edge row by id, in read order.
  */
 async function endpointEdges(
@@ -2505,9 +2569,9 @@ async function endpointEdges(
   caps: ReadonlyMap<string, RelationCap>,
   ends: Iterable<readonly [string, string, string]>,
   every?: Map<string, EdgeRow[]>,
+  seen = new Set<string>(),
 ): Promise<Map<string, EdgeRow>> {
   const found = new Map<string, EdgeRow>();
-  const seen = new Set<string>();
   for (const [rtype, fromEntity, toEntity] of ends) {
     const cap = caps.get(rtype);
     for (const [side] of cap?.limits ?? []) {
@@ -2621,6 +2685,9 @@ export interface ContradictionOptions {
 /**
  * Prepare the contradiction check for a write, reading the current relations it can conflict with.
  *
+ * Under supersede it also reads, and locks, the other endpoint of each relation that a relation with the same
+ * endpoints retired, since that endpoint can have displaced it earlier.
+ *
  * @param runner (Runner): the graph runner.
  * @param ns (string): the namespace.
  * @param options (ContradictionOptions): the mode and the max_count limits.
@@ -2636,7 +2703,7 @@ async function contradictionCheck(
   const { contradiction = "off", caps } = options;
   if (contradiction === "off" || !caps?.size) return [null, new Map()];
   const every = new Map<string, EdgeRow[]>();
-  const [existing, history] = await constrainedCurrent(runner, ns, caps, ends, every);
+  const [existing, history] = await constrainedCurrent(runner, ns, caps, ends, every, contradiction === "supersede");
   const tracker = new Contradictions(
     caps,
     contradiction,

@@ -308,6 +308,10 @@ describe.skipIf(!PY)("cross-language conformance with the Python SDK", () => {
       const moved = fromTs as { moved_later: unknown[][]; moved_later_valid: string[] };
       expect(moved.moved_later).toEqual([[1, false, nakatomi, "2022-01-01T00:00:00Z"]]);
       expect(moved.moved_later_valid).toEqual([nakatomi]);
+      const parallel = (fromTs as { parallel_retirement: Record<string, Record<string, unknown[]>> })
+        .parallel_retirement;
+      expect(parallel.chronological!["relation:old"]).toEqual([1, false, "relation:new", "2020-02-15T00:00:00Z"]);
+      expect(parallel.other_end_unread!["relation:f0"]).toEqual([1, false, "relation:f3", "2020-11-15T00:00:00Z"]);
       const apertureMia = ids.relationId("person:mia", "WORKS_AT", "company:aperture");
       const gap = fromTs as { moved_earlier_gap: unknown[][]; moved_earlier_gap_valid: string[] };
       expect(gap.moved_earlier_gap).toEqual([[1, false, apertureMia, "2014-01-01T00:00:00Z"]]);

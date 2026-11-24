@@ -3388,6 +3388,68 @@ export async function supersede(graph: SelfGraph): Promise<Record<string, unknow
       v.invalidated_at ? jsonIso(v.invalidated_at) : null,
     ]);
   }
+  const parallel_retirement: Record<string, unknown> = {};
+  for (const [name, [fromMax, toMax], arrivals] of [
+    [
+      "chronological",
+      [2, 1],
+      [
+        ["old", "initech", 1],
+        ["new", "initech", 2],
+        ["other", "acme", 12],
+      ],
+    ],
+    [
+      "other_end_unread",
+      [2, 2],
+      [
+        ["f0", "initech", 3],
+        ["f1", "acme", 4],
+        ["f3", "initech", 11],
+        ["f2", "initech", 12],
+      ],
+    ],
+  ] as const) {
+    const capped = new SelfGraph(graph.store, {
+      namespace: `${graph.namespace}-parallel-${name}`,
+      schema: {
+        entities: SUPERSEDE_SCHEMA.entities,
+        relations: [
+          {
+            type: "WORKS_AT",
+            from: { types: ["Person"], max_count: fromMax },
+            to: { types: ["Company"], max_count: toMax },
+          },
+        ],
+      },
+      contradiction: "supersede",
+    });
+    await capped.initialize();
+    await capped.insert.facts({
+      entities: [
+        ...["Ann", "Bob"].map((n) => ({ type: "Person", name: n })),
+        ...["Initech", "Acme"].map((n) => ({ type: "Company", name: n })),
+      ],
+    });
+    for (const [rid, company, month] of arrivals) {
+      await capped.insert.facts({
+        relations: [
+          {
+            id: `relation:${rid}`,
+            from_entity: rid === "f2" ? "person:bob" : "person:ann",
+            type: "WORKS_AT",
+            to_entity: `company:${company}`,
+            event_time: new Date(Date.UTC(2020, month - 1, 15)),
+          },
+        ],
+      });
+    }
+    const states: Record<string, unknown> = {};
+    for (const r of (await capped.relations.list({ include_invalidated: true })).items) {
+      states[r.id] = [r.revision, r.is_current, r.invalidated_by, r.invalidated_at ? jsonIso(r.invalidated_at) : null];
+    }
+    parallel_retirement[name] = states;
+  }
   await graph.insert.facts({
     entities: [{ type: "Person", name: "Kim" }, ...["Massive", "Nakatomi"].map((name) => ({ type: "Company", name }))],
   });
@@ -3487,6 +3549,7 @@ export async function supersede(graph: SelfGraph): Promise<Record<string, unknow
     subms,
     undated_correction,
     certified_update,
+    parallel_retirement,
     moved_later,
     moved_later_valid,
     moved_earlier_gap,

@@ -2234,6 +2234,37 @@ class Contradictions:
                 return valid[limit - 1], t
         return by, at
 
+    def _shared_displacement(
+        self,
+        rid: str,
+        by: str,
+        found: tuple[str, datetime],
+        key: tuple[str, str, str],
+        retired: Mapping[str, tuple[str, datetime]],
+    ) -> tuple[str, datetime]:
+        """The earliest displacement of a retired relation across the endpoints its retiring relation shares with it.
+
+        @param rid (str): the retired relation id.
+        @param by (str): the relation that retired it.
+        @param found (tuple[str, datetime]): the displacing relation id and time at the endpoint being settled.
+        @param key (tuple[str, str, str]): the endpoint being settled.
+        @param retired (Mapping[str, tuple[str, datetime]]): pending retirements from the current settle run.
+        @return (tuple[str, datetime]): the displacing relation id and the earliest displacement time.
+        """
+        version = self._versions[rid][-1]
+        for other, limit in _cap_slots(self._caps, version.type, version.from_entity, version.to_entity):
+            facts = {**self._past.get(other, {}), **self._groups.get(other, {})}
+            if other == key or by not in facts:
+                continue
+            newer = self._newer(facts, rid)
+            if len(newer) < limit:
+                continue
+            windows = {fact: self._fact_windows(fact, retired) for fact in facts}
+            displaced = self._displaced_at(newer, limit, rid, windows)
+            if displaced[1] < found[1]:
+                found = displaced
+        return found
+
     def _seat(self, key: tuple[str, str, str], rid: str, rank: tuple) -> None:
         self._groups.setdefault(key, {})[rid] = rank
         self._past.get(key, {}).pop(rid, None)
@@ -2351,7 +2382,9 @@ class Contradictions:
                 ended = retired.get(rid, self._ended.get(rid))
                 if ended is None or len(newer) < limit:
                     continue
-                by, at = self._displaced_at(newer, limit, rid, windows)
+                by, at = self._shared_displacement(
+                    rid, ended[0], self._displaced_at(newer, limit, rid, windows), key, retired
+                )
                 if (by, at) != ended and (ended[0] in facts or at < ended[1]):
                     retired[rid] = self._ended[rid] = (by, at)
                     windows[rid] = self._fact_windows(rid, retired)
@@ -2457,6 +2490,7 @@ async def _endpoint_edges(
     caps: Mapping[str, RelationCap],
     ends: Iterable[tuple[str, str, str]],
     every: dict[str, list[dict]] | None = None,
+    seen: set[tuple[str, str, str]] | None = None,
 ) -> dict[str, dict]:
     """Read the newest version of every relation at the constrained endpoints of some relations.
 
@@ -2465,10 +2499,12 @@ async def _endpoint_edges(
     @param caps (Mapping[str, RelationCap]): the schema's max_count limits by relation type.
     @param ends (Iterable[tuple[str, str, str]]): (normalized type, source id, destination id) of each relation.
     @param every (dict[str, list[dict]] | None): receives every version read, by relation id, when given.
+    @param seen (set[tuple[str, str, str]] | None): the (side, endpoint, stored type) reads already made, which are
+        skipped and added to.
     @return (dict[str, dict]): each relation's newest edge row by id, in read order.
     """
     found: dict[str, dict] = {}
-    seen: set[tuple[str, str, str]] = set()
+    seen = set() if seen is None else seen
     for rtype, from_entity, to_entity in ends:
         cap = caps.get(rtype)
         for side, _ in cap.limits if cap else ():
@@ -2495,6 +2531,9 @@ async def _contradiction_check(
 ) -> tuple[Contradictions | None, dict[str, dict]]:
     """Prepare the contradiction check for a write, reading the current relations it can conflict with.
 
+    Under supersede it also reads, and locks, the other endpoint of each relation that a relation with the same
+    endpoints retired, since that endpoint can have displaced it earlier.
+
     @param runner (Any): graph runner.
     @param ns (str): namespace.
     @param contradiction (str): "off", "warn", "supersede", or "strict".
@@ -2505,8 +2544,22 @@ async def _contradiction_check(
     """
     if contradiction == "off" or not caps:
         return None, {}
+    ends = list(ends)
     every: dict[str, list[dict]] = {}
-    found = await _endpoint_edges(runner, ns, caps, ends, every)
+    seen: set[tuple[str, str, str]] = set()
+    found = await _endpoint_edges(runner, ns, caps, ends, every, seen)
+    if contradiction == "supersede":
+        shared = [
+            (e["type"], e["from_id"], e["to_id"])
+            for e in found.values()
+            if not e["props"]["is_current"]
+            and (twin := found.get(e["props"].get("invalidated_by")))
+            and (twin["from_id"], twin["to_id"]) == (e["from_id"], e["to_id"])
+            and len(_cap_slots(caps, e["type"], e["from_id"], e["to_id"])) > 1
+        ]
+        for eid in sorted(set(_relation_lock_ids(caps, shared)) - set(_relation_lock_ids(caps, ends))):
+            await runner.lock_node(ns, L_ENTITY, eid)
+        found = {**found, **await _endpoint_edges(runner, ns, caps, shared, every, seen)}
     current = [_relation_of(e) for e in found.values() if e["props"]["is_current"]]
     history = [
         _relation_of(e)
