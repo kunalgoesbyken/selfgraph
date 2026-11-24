@@ -18,6 +18,7 @@ from selfgraph import (
     Extraction,
     KuzuStore,
     Neo4jStore,
+    NotFoundError,
     Schema,
     SelfGraph,
     ValidationError,
@@ -3082,8 +3083,115 @@ def exit_codes() -> list:
     return [[code, 2 if code in _USAGE_CODES else 1] for code in sorted(HINTS)]
 
 
+CUT_WRITES = (
+    "upsert_node",
+    "upsert_nodes",
+    "create_edge",
+    "create_edges",
+    "delete_node",
+    "delete_nodes",
+    "delete_nodes_by",
+    "delete_edges",
+    "delete_edges_touching_by_type",
+)
+
+
+async def cut_decision_delete(store, ns, target, cut):
+    """Delete with the store write at an index failed, retry the delete, and read back what is left.
+
+    @param store (KuzuStore): the store.
+    @param ns (str): a fresh namespace.
+    @param target (str): what to delete: "relation", "entity", "actor", or "decision".
+    @param cut (int | None): the index of the store write to fail, or None to fail none.
+    @return (tuple[int, dict]): the number of store writes the first delete made, and what is left after the retry.
+    """
+    graph = SelfGraph(store=store, namespace=ns)
+    await graph.initialize()
+    for name in ("Acme", "Beta", "Gamma"):
+        await graph.entities.create(name, "Org")
+    await graph.entities.create("Bob", "Person")
+    first = await graph.relations.create("org:acme", "OWNS", "org:beta")
+    second = await graph.relations.create("org:acme", "OWNS", "org:gamma")
+    await graph.decisions.create("Buy", id="decision:d1", steps=[first.id, second.id], actor_entity="person:bob")
+
+    def remove():
+        """Start the delete under test.
+
+        @return (Awaitable): the delete.
+        """
+        if target == "relation":
+            return graph.relations.delete(first.id)
+        if target == "entity":
+            return graph.entities.delete("org:beta")
+        if target == "actor":
+            return graph.entities.delete("person:bob")
+        return graph.decisions.delete("decision:d1")
+
+    calls = []
+
+    def counting(name):
+        """Wrap one store write so it is counted and fails when it is the one to cut.
+
+        @param name (str): the store method.
+        @return (Callable): the wrapped method.
+        """
+        original = getattr(store, name)
+
+        async def wrapped(*args, **kwargs):
+            """Count the write, then fail it or run it.
+
+            @return (Any): what the store method returns.
+            """
+            calls.append(name)
+            if len(calls) - 1 == cut:
+                raise ConnectionError("connection lost")
+            return await original(*args, **kwargs)
+
+        return wrapped
+
+    for name in CUT_WRITES:
+        setattr(store, name, counting(name))
+    try:
+        await remove()
+    except ConnectionError:
+        pass
+    finally:
+        for name in CUT_WRITES:
+            delattr(store, name)
+    try:
+        await remove()
+    except NotFoundError:
+        pass
+    return len(calls), {
+        "decisions": [d.id for d in (await graph.decisions.list()).items],
+        "step_nodes": sorted(n["id"] for n in await store.match_nodes(ns, _serde.L_STEP)),
+        "relations": sorted(r.id for r in (await graph.relations.list()).items),
+        "entities": sorted(e.id for e in (await graph.entities.list()).items),
+    }
+
+
+async def cut_decision_deletes():
+    """Cut each delete that removes a decision at every store write, retry it, and read back what is left.
+
+    @return (dict): per delete, what a clean delete leaves, and the indexes of the cuts whose retry left anything else.
+    """
+    import tempfile
+
+    store = KuzuStore(os.path.join(tempfile.mkdtemp(prefix="sg-conf-cut-"), "g.kuzu"))
+    out = {}
+    for target in ("relation", "entity", "actor", "decision"):
+        writes, whole = await cut_decision_delete(store, f"{target}-clean", target, None)
+        cuts = [await cut_decision_delete(store, f"{target}-{cut}", target, cut) for cut in range(writes)]
+        out[target] = {"whole": whole, "failed_cuts": [cut for cut, (_, state) in enumerate(cuts) if state != whole]}
+    await store.close()
+    return out
+
+
 async def main():
     cmd = sys.argv[1]
+    if cmd == "kuzu_cut_delete":
+        json.dump(await cut_decision_deletes(), sys.stdout)
+        return
     if cmd == "exit_codes":
         json.dump(exit_codes(), sys.stdout)
         return
